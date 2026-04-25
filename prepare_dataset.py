@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
+"""Download Alpaca Cleaned and convert it to a Gemma-4 SFT JSONL.
+
+Reads from the Hugging Face hub (`yahma/alpaca-cleaned`), wraps each row in
+the Gemma-4 chat template, and writes:
+
+    datasets/alpaca-cleaned/alpaca_cleaned.jsonl       raw rows for inspection
+    datasets/alpaca-cleaned/alpaca_gemma4_sft.jsonl    prompt/completion pairs
+    datasets/alpaca-cleaned/preview.md                 human-readable preview
+
+The training script (`finetune.py`) consumes the SFT JSONL.
+"""
 import argparse
 import json
 from pathlib import Path
 
 from datasets import load_dataset
-
 
 DEFAULT_DATASET = "yahma/alpaca-cleaned"
 DEFAULT_OUT_DIR = Path("datasets/alpaca-cleaned")
@@ -19,6 +29,9 @@ def build_user_message(instruction: str, input_text: str) -> str:
 
 
 def to_gemma4_pair(row: dict) -> dict:
+    # The Gemma-4 chat template uses <|turn>role\n...<turn|>\n boundaries.
+    # Splitting into prompt / completion lets TRL mask the prompt tokens so
+    # the loss is only computed on the model's response.
     user_message = build_user_message(row.get("instruction", ""), row.get("input", ""))
     output = (row.get("output") or "").strip()
     return {
@@ -41,33 +54,27 @@ def write_preview(path: Path, rows: list[dict], limit: int) -> None:
         "",
     ]
     for index, row in enumerate(rows[:limit], start=1):
-        lines.extend(
-            [
-                f"## Example {index}",
-                "",
-                f"Instruction: {row.get('instruction', '').strip()}",
-                "",
-                f"Input: {row.get('input', '').strip() or '(empty)'}",
-                "",
-                f"Output: {row.get('output', '').strip()}",
-                "",
-            ]
-        )
+        lines.extend([
+            f"## Example {index}",
+            "",
+            f"**Instruction:** {row.get('instruction', '').strip()}",
+            "",
+            f"**Input:** {row.get('input', '').strip() or '(empty)'}",
+            "",
+            f"**Output:** {row.get('output', '').strip()}",
+            "",
+        ])
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Download Alpaca Cleaned and prepare it for Gemma-4 SFT."
-    )
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--split", default="train")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument(
-        "--max-records",
-        type=int,
-        default=0,
-        help="Optional cap for tutorial experiments. 0 means keep the full split.",
+        "--max-records", type=int, default=0,
+        help="Cap the number of rows. 0 means keep the whole split.",
     )
     parser.add_argument("--preview-examples", type=int, default=8)
     return parser.parse_args()
@@ -94,9 +101,9 @@ def main() -> None:
 
     print(f"Dataset: {args.dataset}")
     print(f"Rows: {len(raw_rows)}")
-    print(f"Raw JSONL: {raw_path}")
+    print(f"Raw JSONL:         {raw_path}")
     print(f"Gemma-4 SFT JSONL: {sft_path}")
-    print(f"Preview: {preview_path}")
+    print(f"Preview:           {preview_path}")
 
 
 if __name__ == "__main__":

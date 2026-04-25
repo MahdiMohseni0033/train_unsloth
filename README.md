@@ -1,188 +1,178 @@
-# Unsloth ROCm Install on Kelvin2
+# train_unsloth — QLoRA fine-tuning of Gemma-4 26B A4B with Unsloth
 
-This directory contains a Kelvin2-specific Unsloth installer setup for AMD GPUs.
-It keeps the virtual environment, Python package caches, Hugging Face model
-cache, temp files, Torch cache, and Triton cache under:
+A small, self-contained tutorial project that takes you from a fresh ROCm
+node to a fine-tuned Gemma-4 model and back to inference. Everything runs
+through a handful of Python scripts and one setup shell script.
 
-```bash
-/mnt/scratch2/users/mmohseni
+```text
+.
+├── setup.sh              # one-shot installer (Unsloth + ROCm PyTorch + deps)
+├── prepare_dataset.py    # download yahma/alpaca-cleaned and format for Gemma-4
+├── inspect_format.py     # show exactly what the model sees vs the loss target
+├── finetune.py           # QLoRA SFT (TRL SFTTrainer + Unsloth FastModel)
+├── plot_training.py      # render loss / lr / grad-norm PNGs
+├── inference.py          # load the LoRA adapter and generate
+├── evaluate.py           # compare generations against held-out ground truth
+├── README.md             # this file (quickstart)
+└── tutorial.md           # deep walkthrough: SFT, LoRA, prompts, common errors
 ```
 
-Nothing should be installed under the quota-limited home directory.
+`datasets/` and `outputs/` are git-ignored — they are produced on first run.
 
-## Files
+---
 
-- `install.sh` - patched Unsloth installer. It redirects install paths and caches
-  to scratch and installs ROCm PyTorch on AMD GPU nodes.
-- `activate.sh` - activates the installed Unsloth environment and exports the
-  same scratch cache variables.
-- `reinstall_unsloth_amd_kelvin2.sh` - one-command reinstall and verification
-  wrapper for Kelvin2 AMD GPU jobs.
-- `run_main_amd_kelvin2.sh` - runs `main.py` on an AMD GPU node and refuses to
-  run if only a login node is visible.
-- `prepare_alpaca_dataset.py` - downloads the Alpaca Cleaned dataset locally.
-- `finetune_gemma4_alpaca.py` - tutorial QLoRA fine-tuning script.
-- `run_finetune_alpaca_amd_kelvin2.sh` - Slurm-aware fine-tuning wrapper.
-- `tutorial.md` - step-by-step fine-tuning tutorial.
-- `main.py` - smoke test that loads `unsloth/gemma-4-26b-a4b-it` in 4-bit mode
-  and applies a PEFT setup.
+## 1. Requirements
 
-## Reinstall Everything
+- A machine with an **AMD ROCm GPU** (the project was developed on Kelvin2
+  MI300X, 192 GB) — runs cleanly anywhere ROCm 6.3 + PyTorch 2.9.1 work.
+- Python ≥ 3.11 (the installer can pin one with `--python 3.12`).
+- Around 50 GB of free scratch for the Hugging Face cache + adapter outputs.
+- An NVIDIA + CUDA build of PyTorch will also work; the ROCm-specific
+  monkey-patches in `finetune.py` and `inference.py` are no-ops on CUDA.
 
-You must run the reinstall on an AMD GPU compute node. If you already have an
-active Slurm GPU job, pass its job id:
+The defaults assume `/mnt/scratch2/users/mmohseni` as the install root so
+that nothing lands in your home quota. Override with `UNSLOTH_INSTALL_ROOT`
+before running `./setup.sh`.
 
-```bash
-cd /mnt/scratch2/users/mmohseni/projects/train_unsloth
-./reinstall_unsloth_amd_kelvin2.sh --jobid 8406919
-```
+---
 
-For a future job, replace `8406919` with the current active Slurm job id. You
-can also use an environment variable:
+## 2. Install
+
+Clone, then run the installer **on a GPU compute node** (not the login node):
 
 ```bash
-KELVIN_JOB_ID=8406919 ./reinstall_unsloth_amd_kelvin2.sh
+git clone git@github.com:MahdiMohseni0033/train_unsloth.git
+cd train_unsloth
+./setup.sh                 # installs Unsloth Studio + ROCm PyTorch
 ```
 
-If you are already inside an AMD GPU allocation, run:
+The installer creates a virtual environment at:
+
+```text
+$UNSLOTH_INSTALL_ROOT/.unsloth/studio/unsloth_studio
+```
+
+For a Kelvin2 Slurm allocation use `srun` to run the installer on the
+allocated node, for example:
 
 ```bash
-./reinstall_unsloth_amd_kelvin2.sh
+srun --jobid <your_gpu_job_id> --overlap --pty bash
+cd /path/to/train_unsloth
+./setup.sh
 ```
 
-To reinstall packages and run only the ROCm smoke test, skipping the large model
-load in `main.py`:
+---
+
+## 3. Activate the environment
+
+Activation is a single command — no helper script needed:
 
 ```bash
-./reinstall_unsloth_amd_kelvin2.sh --jobid 8406919 --no-main
+# Activate the Unsloth virtual environment + scratch HF/torch caches
+export UNSLOTH_INSTALL_ROOT=/mnt/scratch2/users/mmohseni
+export HF_HOME="$UNSLOTH_INSTALL_ROOT/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export TORCH_HOME="$UNSLOTH_INSTALL_ROOT/.cache/torch"
+export TRITON_CACHE_DIR="$UNSLOTH_INSTALL_ROOT/.cache/triton"
+source "$UNSLOTH_INSTALL_ROOT/.unsloth/studio/unsloth_studio/bin/activate"
 ```
 
-## Activate Later
-
-After installation, activate the environment with:
+If you keep the default install root the **shortest** form is just:
 
 ```bash
-cd /mnt/scratch2/users/mmohseni/projects/train_unsloth
-source ./activate.sh
+source /mnt/scratch2/users/mmohseni/.unsloth/studio/unsloth_studio/bin/activate
 ```
 
-The virtual environment is:
+(The HF/torch cache exports are only needed if your `$HOME` is quota-limited.)
+
+---
+
+## 4. End-to-end run
+
+Each script is independent and prints a one-line description of what it
+does when called with `--help`.
 
 ```bash
-/mnt/scratch2/users/mmohseni/.unsloth/studio/unsloth_studio
+# 1) Download Alpaca Cleaned and convert to a Gemma-4 chat-template SFT JSONL.
+#    Runs on CPU, no GPU needed.
+python prepare_dataset.py
+
+# 2) Look at what the model will actually see during training.
+#    Reads the tokenizer only — runs on CPU.
+python inspect_format.py --num-examples 2
+
+# 3) QLoRA fine-tune. Needs a GPU. Tutorial defaults are tiny on purpose
+#    (~30 steps over 512 samples, ~1-2 min on MI300X).
+python finetune.py
+
+# 4) Plot training loss / learning rate / grad norm.
+python plot_training.py
+#    -> outputs/gemma4-26b-a4b-it-alpaca-lora/plots/{loss,lr,grad_norm}.png
+
+# 5) Run inference with the saved adapter.
+python inference.py --demo
+
+# 6) Evaluate against held-out rows of the dataset (last N rows).
+#    Add --include-base to compare against the un-fine-tuned model.
+python evaluate.py --num-samples 5 --include-base
 ```
 
-Activating the environment on `login4` is useful for inspecting packages, but it
-does not provide a GPU. Do not run `python main.py` directly from a login node.
-
-## Run main.py
-
-Run `main.py` through Slurm so the process lands on the AMD GPU compute node:
+A typical smoke test (so you don't sit through the full default run):
 
 ```bash
-cd /mnt/scratch2/users/mmohseni/projects/train_unsloth
-./run_main_amd_kelvin2.sh --jobid 8406919
+python finetune.py --max-steps 2 --train-samples 16
+python plot_training.py
+python inference.py --demo --max-new-tokens 80
+python evaluate.py --num-samples 2
 ```
 
-Replace `8406919` with the current active GPU job id.
+---
 
-If you are already inside an AMD GPU allocation, run:
+## 5. Outputs
 
-```bash
-./run_main_amd_kelvin2.sh
+```text
+outputs/gemma4-26b-a4b-it-alpaca-lora/
+├── checkpoint-XX/               # intermediate Trainer checkpoints
+├── final_adapter/               # LoRA weights + tokenizer (small, ~MB)
+├── runs/<timestamp>/            # TensorBoard event files (HF Trainer default)
+├── plots/{loss,lr,grad_norm}.png  # rendered by plot_training.py
+├── trainer_state.json
+└── sample_generation.txt
+outputs/inference_samples.md     # appended by every inference.py run
+outputs/evaluation_report.md     # written by evaluate.py
+outputs/evaluation_metrics.json
 ```
 
-## Verification
+The LoRA adapter is small (tens of MB) — it does **not** include the base
+model weights. Combine the two at load time, exactly like `inference.py` does.
 
-The reinstall wrapper checks that:
+---
 
-- It is running on an AMD ROCm GPU node.
-- No NVIDIA GPU is selected.
-- PyTorch is a ROCm build.
-- `torch.cuda.is_available()` is true through ROCm.
-- The visible GPU can run a small matrix multiplication.
-- `bitsandbytes` and `unsloth` import successfully.
+## 6. Where to read next
 
-Then, unless `--no-main` is used, it runs:
+- `tutorial.md` — the conceptual walkthrough: what supervised fine-tuning is,
+  what the Alpaca dataset looks like, why the chat template matters, why
+  only the completion tokens contribute to the loss, what LoRA / QLoRA buy
+  you, and how to read the curves `plot_training.py` produces.
+- `inspect_format.py` (the script itself) — the most concrete answer to
+  "what does the model actually see?". Run it once before training.
 
-```bash
-python main.py
-```
+---
 
-The successful run on Kelvin2 used:
+## 7. Verified versions (Kelvin2 MI300X)
 
 ```text
 AMD Instinct MI300X
 torch 2.9.1+rocm6.3
 ROCm Toolkit 6.3.42134-a9a80e791
-bitsandbytes 0.50.0.dev0
 unsloth 2026.4.8
 transformers 5.5.0
 trl 0.24.0
 datasets 4.3.0
 triton 3.6.0
+bitsandbytes 0.50.0.dev0
 ```
 
-The same MI300X node also runs a full Gemma-4 26B-A4B QLoRA fine-tune end
-to end via `./run_finetune_alpaca_amd_kelvin2.sh` — see `tutorial.md`. A
-2-step / 16-sample smoke run uses about 47 GiB of GPU memory and finishes
-training in roughly 20 s.
-
-## Logs
-
-Each reinstall creates timestamped logs in this directory:
-
-```text
-install-YYYYMMDD_HHMMSS.log
-gpu-check-YYYYMMDD_HHMMSS.log
-main-YYYYMMDD_HHMMSS.log
-```
-
-The earlier successful logs are:
-
-```text
-install-rerun.log
-main-run.log
-```
-
-## Run the Fine-Tune Tutorial
-
-The full tutorial is in `tutorial.md`. To execute it end to end on Kelvin2:
-
-```bash
-cd /mnt/scratch2/users/mmohseni/projects/train_unsloth
-./run_finetune_alpaca_amd_kelvin2.sh --jobid <active_gpu_job_id>
-```
-
-Replace `<active_gpu_job_id>` with the current Slurm AMD GPU job id. The
-wrapper prepares the Alpaca dataset on the calling node and then runs
-`finetune_gemma4_alpaca.py` on the GPU node. For a quick smoke test:
-
-```bash
-./run_finetune_alpaca_amd_kelvin2.sh --jobid <active_gpu_job_id> -- --max-steps 2 --train-samples 16
-```
-
-`finetune_gemma4_alpaca.py` ships with three Kelvin2-specific workarounds
-for the current Unsloth + ROCm wheel combination (`dataset_num_proc=None`,
-`UNSLOTH_COMPILE_DISABLE=1`, and a ROCm-aware patch to bypass
-`torch._grouped_mm`). See `tutorial.md` "Common Errors" for details.
-
-## Notes
-
-The wrapper uses the patched installer default that skips Studio's optional
-GGUF `llama.cpp` source build. This avoids failing the Python/ROCm training
-environment when Unsloth does not publish a compatible Linux prebuilt for the
-AMD node.
-
-If you explicitly want to attempt the optional `llama.cpp` source build, run:
-
-```bash
-UNSLOTH_SKIP_GGUF_BUILD=0 ./reinstall_unsloth_amd_kelvin2.sh --jobid 8406919
-```
-
-That optional Studio component is not required for the `main.py` training smoke
-test.
-
-
-srun --jobid=8408951 --overlap --pty /bin/bash
-# train_unsloth
+A 2-step / 16-sample smoke run uses ~47 GiB of GPU memory and finishes
+training in roughly 20 s on a single MI300X.

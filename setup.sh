@@ -1759,6 +1759,14 @@ if [ "$TAURI_MODE" = true ]; then
     exit 0
 fi
 
+# ── Tutorial extras (used by plot_training.py and finetune.py's TB logger) ──
+if [ -x "$VENV_DIR/bin/python" ]; then
+    step "extras" "installing tutorial extras (tensorboard, matplotlib)"
+    "$VENV_DIR/bin/python" -m pip install --quiet --disable-pip-version-check \
+        tensorboard matplotlib >/dev/null 2>&1 || \
+        substep "warning: failed to install tutorial extras (tensorboard/matplotlib)" "$C_WARN"
+fi
+
 echo ""
 printf "  ${C_TITLE}%s${C_RST}\n" "Unsloth Studio installed!"
 printf "  ${C_DIM}%s${C_RST}\n" "$RULE"

@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+"""QLoRA supervised fine-tuning of Gemma-4 26B A4B on Alpaca Cleaned.
+
+Loads the model in 4-bit via Unsloth's `FastModel`, attaches LoRA adapters
+to the attention projections, runs TRL's `SFTTrainer` with completion-only
+loss, and saves the LoRA adapter + tokenizer to `--output-dir/final_adapter`.
+
+Run `prepare_dataset.py` first so that the SFT JSONL exists, then launch
+this script on a ROCm GPU node.
+"""
 import os
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # torch 2.9.1+rocm6.3 ships an inductor that reads `binary.metadata.cluster_dims`,
-# but the ROCm Triton 3.6.0 KernelMetadata does not expose that field, so any
-# torch.compile-generated kernel raises AttributeError at launch time. Until a
-# matched torch/triton-rocm pair lands, run the tutorial in eager mode.
+# but ROCm Triton 3.6.0's KernelMetadata does not expose that field, so any
+# torch.compile-generated kernel raises AttributeError at launch. Run eager.
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
@@ -50,25 +58,24 @@ def require_rocm_gpu() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Tutorial QLoRA fine-tuning for Gemma-4 26B A4B on Alpaca Cleaned."
-    )
-    parser.add_argument("--model-name", default=DEFAULT_MODEL)
-    parser.add_argument("--dataset-jsonl", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--max-seq-length", type=int, default=2048)
-    parser.add_argument("--max-steps", type=int, default=30)
-    parser.add_argument("--train-samples", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=5)
-    parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--save-steps", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=16)
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--model-name", default=DEFAULT_MODEL)
+    p.add_argument("--dataset-jsonl", type=Path, default=DEFAULT_DATASET)
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    p.add_argument("--max-seq-length", type=int, default=2048)
+    p.add_argument("--max-steps", type=int, default=30)
+    p.add_argument("--train-samples", type=int, default=512,
+                   help="Cap the train set. 0 = use everything.")
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum", type=int, default=8)
+    p.add_argument("--learning-rate", type=float, default=2e-4)
+    p.add_argument("--warmup-steps", type=int, default=5)
+    p.add_argument("--logging-steps", type=int, default=1)
+    p.add_argument("--save-steps", type=int, default=30)
+    p.add_argument("--seed", type=int, default=3407)
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=16)
+    return p.parse_args()
 
 
 def main() -> None:
@@ -78,7 +85,7 @@ def main() -> None:
     if not args.dataset_jsonl.exists():
         raise SystemExit(
             f"Dataset file not found: {args.dataset_jsonl}\n"
-            "Run ./prepare_alpaca_dataset.py first."
+            "Run `python prepare_dataset.py` first."
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -124,13 +131,15 @@ def main() -> None:
         lr_scheduler_type="linear",
         # Keep tokenization in-process. datasets 4.x spawns a pool whenever
         # num_proc >= 1, and the Unsloth-patched tokenizer captured by TRL's
-        # tokenize_fn carries a torch._dynamo ConfigModuleInstance that is not
-        # picklable, so any worker fork raises TypeError.
+        # tokenize_fn carries a torch._dynamo ConfigModuleInstance that is
+        # not picklable, so any worker fork raises TypeError.
         dataset_num_proc=None,
         seed=args.seed,
         bf16=True,
         fp16=False,
-        report_to="none",
+        # Log to TensorBoard so plot_training.py can read the event files.
+        # Transformers writes them under <output_dir>/runs/<timestamp>/.
+        report_to="tensorboard",
         completion_only_loss=True,
         packing=False,
         dataloader_num_workers=0,
@@ -150,6 +159,8 @@ def main() -> None:
     tokenizer.save_pretrained(adapter_dir)
     print(f"Saved LoRA adapter and tokenizer to: {adapter_dir}")
 
+    # Quick post-training sample so the user sees an immediate output even
+    # without running inference.py separately.
     if hasattr(model, "for_inference"):
         model.for_inference()
     else:
